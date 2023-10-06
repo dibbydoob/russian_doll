@@ -10,7 +10,15 @@ from abc import ABC
 from abc import abstractmethod
 
 import db_logs as db_logs
+import quant_stats
 
+'''
+NOTE 1:
+-> Open issue in dill, abstract class and methods not pickle-able, 
+    pathos pickles over dill...mulitprocess issues
+    https://github.com/uqfoundation/dill/issues/332
+
+'''
 def get_pnl_stats(last_weights, last_units, baseclose_prev, ret_row, leverages):
     ret_row = np.nan_to_num(ret_row, nan=0, posinf=0, neginf=0)
     day_pnl = np.sum(last_units * baseclose_prev * ret_row)
@@ -18,7 +26,7 @@ def get_pnl_stats(last_weights, last_units, baseclose_prev, ret_row, leverages):
     capital_ret = nominal_ret * leverages[-1]
     return day_pnl, nominal_ret, capital_ret
 
-class BaseAlpha(ABC):
+class BaseAlpha(): #ABC):
     '''Accepts instruments with fx code %attached'''
     def __init__(
         self, 
@@ -37,7 +45,7 @@ class BaseAlpha(ABC):
         self.commrates = commrates if commrates is not None else np.zeros(len(instruments))
         self.longswps = longswps if longswps is not None else np.zeros(len(instruments))
         self.shortswps = shortswps if shortswps is not None else np.zeros(len(instruments))
-        self.dfs = dfs
+        self.datacopy = deepcopy(dfs) #Note 3
         self.positional_inertia = positional_inertia
     
     def set_instruments_settings(self, instruments, execrates=None, commrates=None, longswps=None, shortswps=None):
@@ -48,7 +56,7 @@ class BaseAlpha(ABC):
         self.shortswps = shortswps if shortswps is not None else np.zeros(len(instruments))
         
     def set_dfs(self, dfs):
-        self.dfs = dfs
+        self.datacopy = deepcopy(dfs)
     
     def get_instruments(self):
         return self.instruments
@@ -79,15 +87,95 @@ class BaseAlpha(ABC):
         return self.leverages_ser
     
     def get_last_closes(self, fx_adjusted=False):
-        if fx_adjusted:
-            adj_closes = self.baseclosedf.values[-1]
-            return {self.instruments[i]: adj_closes[i] for i in range(len(self.instruments))} 
-        closes = self.closedf.values[-1]
-        return {self.instruments[i] : closes[i] for i in range(len(self.instruments))}
+        closes = self.baseclosedf.values[-1] if fx_adjusted else self.closedf.values[-1]
+        return {self.instruments[i]: closes[i] for i in range(len(self.instruments))} 
 
-    async def write_stats(self, children=False):
+    #NOTE 2
+    def get_zero_filtered_stats(self):
+        df = self.portfolio_df
+        capital_ret = self.portfolio_df["capital_ret"]
+        non_zero_idx = capital_ret.loc[capital_ret != 0].index
+        retdf = self.retdf.loc[non_zero_idx]
+        leverages = self.get_leverages().shift(1).fillna(0).loc[non_zero_idx]
+        weights = self.weights_df.shift(1).fillna(0).loc[non_zero_idx]
+        return {
+            "capital_ret": capital_ret,
+            "retdf": retdf,
+            "leverages": leverages,
+            "weights": weights
+        }
+
+    async def hyothesis_tests(self, num_decision_shuffles=1000, num_data_shuffles=10):
+        zero_filtered_stats = self.get_zero_filtered_stats()
+        retdf, leverages, weights = \
+            zero_filtered_stats["retdf"], \
+            zero_filtered_stats["leverages"], \
+            zero_filtered_stats["weights"]
+
+        def performance_criterion(rets, leverages, weights):
+            capital_ret = [
+                lev_scalar * np.dot(weight, ret) 
+                for lev_scalar, weight, ret in zip(leverages.values, rets.values, weights.values)
+            ]
+            sharpe = np.mean(capital_ret) / np.std(capital_ret) * np.sqrt(253)
+            return sharpe
+        async def time_shuffler(rets, leverages, weights):
+            shuffled_index = quant_stats.permutation_member(list(rets.index))
+            new_ret_df = rets.loc[shuffled_index]
+            new_ret_df.index = rets.index
+            return {"rets": new_ret_df, "leverages": leverages, "weights": weights}
+        async def mapping_shuffler(rets, leverages, weights):
+            shuffled_cols = quant_stats.permutation_member(list(rets))
+            new_ret_df = rets.copy(deep=True)
+            new_ret_df.columns = shuffled_cols
+            new_ret_df = new_ret_df[list(rets)]
+            return {"rets": new_ret_df, "leverages": leverages, "weights": weights}
+        async def data_shuffler_generator(**kwargs):
+            machine_copy = deepcopy(self)
+            machine_copy.datacopy = quant_stats.adjust_prices(dfs=machine_copy.datacopy)
+            insts = machine_copy.instruments
+            bars = [
+                bar[["open", "high", "low", "close", "volume"]]
+                for inst, bar in machine_copy.datacopy.items()
+            ]
+            permuted_bars = quant_stats.permute_multi_bars(bars)
+            machine_copy.datacopy =  {
+                inst : bar for inst, bar in zip(insts, permuted_bars)
+            }
+            await machine_copy.run_simulation()
+            zero_filtered_stats = machine_copy.get_zero_filtered_stats()
+            retdf, leverages, weights = \
+                zero_filtered_stats["retdf"], \
+                zero_filtered_stats["leverages"], \
+                zero_filtered_stats["weights"]
+            return {"rets": retdf, "leverages": leverages, "weights": weights}
+
+        timer_p = await quant_stats.permutation_shuffler_test(
+            criterion_function=performance_criterion, 
+            generator_function=time_shuffler, 
+            m=num_decision_shuffles, rets=retdf, leverages=leverages, weights=weights
+        )
+        picker_p = await quant_stats.permutation_shuffler_test(
+            criterion_function=performance_criterion, 
+            generator_function=mapping_shuffler, 
+            m=num_decision_shuffles, rets=retdf, leverages=leverages, weights=weights)
+        trader_p = await quant_stats.permutation_shuffler_test(
+            criterion_function=performance_criterion, 
+            generator_function=data_shuffler_generator, 
+            m=num_data_shuffles, rets=retdf, leverages=leverages, weights=weights
+        )
+        print("timer_p", timer_p, "picker_p", picker_p, "trader_p", trader_p)
+        return timer_p, picker_p, trader_p
+
+    async def write_stats(
+        self, 
+        significance_tests=True, 
+        children=False, 
+        dec_shuffles=1000, 
+        dat_shuffles=10
+    ):
         assert self.portfolio_df is not None
-        '''do statistical analysis, bootstrapping tests, shattering analysis etc'''
+        '''get descriptive statistics, hypothesis tests, robustness analysis etc'''
         def stats_on_df(portfolio_df):
             tradeful_df = portfolio_df.loc[portfolio_df["capital_ret"] != 0]
             costless_rets = tradeful_df["capital_ret"]
@@ -103,13 +191,18 @@ class BaseAlpha(ABC):
             costdrag_pa = (costless_sharpe - costful_sharpe) * np.std(costless_rets.values) * np.sqrt(253)
         
             return {
-                "costdrag_pa": costdrag_pa,
+                "costdrag_pa": costdrag_pa, #NOTE 4
                 "sharpe_costful": costful_sharpe,
                 "sharpe_costless": costless_sharpe,
                 "sharpe_swapful": swapful_sharpe,
                 "sharpe_execful": execful_sharpe,
                 "sharpe_commful": commful_sharpe,
             }
+        if significance_tests: #NOTE 5
+            await self.hyothesis_tests( 
+                num_decision_shuffles=dec_shuffles, num_data_shuffles=dat_shuffles
+            )
+
         stats_dict = {}
         stats = stats_on_df(self.portfolio_df)
         pprint(stats)
@@ -117,7 +210,7 @@ class BaseAlpha(ABC):
             "df": self.portfolio_df,
             "stats": stats
         }
-        if children:
+        if children: #NOTE 6
             shattered_params = list(deepcopy(self).param_generator(shattered=True))
             for i in range(len(shattered_params)):
                 component_df = await self.run_simulation(shattered=False, param_idx=i)
@@ -127,46 +220,40 @@ class BaseAlpha(ABC):
                     "df": self.portfolio_df,
                     "stats": stats
                 }
-        return stats_dict
+        return stats_dict        
         
-    '''Exposes voldf, retdf, activedf, baseclosedf > child needs to exposre invriskdf, eligiblesdf'''
-    async def compute_metas(self, index):
+    '''Exposes voldf, retdf, activedf, baseclosedf'''
+    def compute_metas(self, index):
         @jit(nopython=True)
         def numba_any(x):
             return int(np.any(x))
-
-        vols, rets, actives, closes, fxconvs = [], [], [], [], []
-
-        aligner = pd.DataFrame(index=index) 
-        for inst in self.instruments: 
-            self.dfs[inst]["vol"] = (-1 + self.dfs[inst]["adj_close"] / self.dfs[inst].shift(1)["adj_close"]).rolling(30).std()
-            self.dfs[inst] = aligner.join(self.dfs[inst])
-            self.dfs[inst] = self.dfs[inst].fillna(method="ffill").fillna(method="bfill")
-            self.dfs[inst]["ret"] = -1 + self.dfs[inst]["adj_close"] / self.dfs[inst].shift(1)["adj_close"]
-            self.dfs[inst]["sampled"] = self.dfs[inst]["adj_close"] != self.dfs[inst].shift(1)["adj_close"]
-            self.dfs[inst]["active"] = self.dfs[inst]["sampled"].rolling(5).apply(numba_any, engine="numba", raw=True).fillna(0)
-            vols.append(self.dfs[inst]["vol"])
-            rets.append(self.dfs[inst]["ret"])
-            actives.append(self.dfs[inst]["active"])
-            closes.append(self.dfs[inst]["adj_close"])
-
+        closes, actives, fxconvs = [], [], []
+        for inst in self.instruments:
+            inst_sampled = self.dfs[inst]["close"] != \
+                self.dfs[inst].shift(1)["close"].fillna(method="bfill")
+            inst_active = inst_sampled \
+                .rolling(5) \
+                .apply(numba_any, engine="numba", raw=True).fillna(0)
+            actives.append(inst_active)
+            closes.append(self.dfs[inst]["close"])
+        
         for inst in self.instruments:
             if inst[-3:] == "USD":
                 fxconvs.append(pd.Series(index=index, data=np.ones(len(index))))
             elif inst[-3:] + "USD%USD" in self.dfs:
-                fxconvs.append(self.dfs[inst[-3:] + "USD%USD"]["adj_close"])
+                fxconvs.append(self.dfs[inst[-3:] + "USD%USD"]["close"])
             elif "USD" + inst[-3:] + "%" + inst[-3:] in self.dfs:
-                fxconvs.append(1 / self.dfs["USD" + inst[-3:] + "%" + inst[-3:]]["adj_close"])
+                fxconvs.append(1 / self.dfs["USD" + inst[-3:] + "%" + inst[-3:]]["close"])
             else:
                 print("no resolution", inst)
                 exit()
-        
-        self.voldf = pd.concat(vols, axis=1)
-        self.voldf.columns = self.instruments
-        self.retdf = pd.concat(rets, axis=1)
-        self.retdf.columns = self.instruments
+
+        #NOTE 7
+        self.voldf = self.pad_value_all_dfs["vols"]
+        self.retdf = self.pad_zero_dfs["rets"] 
         self.activedf = pd.concat(actives, axis=1)
         self.activedf.columns = self.instruments
+
         closedf = pd.concat(closes, axis=1)
         closedf.columns = self.instruments
         fxconvsdf = pd.concat(fxconvs, axis=1)
@@ -185,24 +272,8 @@ class BaseAlpha(ABC):
         ann_realized_vol = np.sqrt(ewmas[-1] * 252)
         return portfolio_vol / ann_realized_vol * ewstrats[-1]
 
-    @abstractmethod
-    def param_generator(self, shattered, param_idx=0):
-        return []
-
     def get_shattered_axis_cardinality(self):
         return len(list(deepcopy(self).param_generator(shattered=True)))
-
-    @abstractmethod
-    def set_positions(self, capital, strat_scalar, portfolio_vol, prev_positions, *args, **kwargs):
-        pass 
-
-    @abstractmethod
-    def post_risk_management(self, nominal_tot, positions, weights, *args, **kwargs):
-        return nominal_tot, positions, weights
-
-    @abstractmethod
-    def zip_data_generator(self):
-        pass
 
     def get_fees(self, baseclose_row, positions, prev_positions):
         delta_positions = np.abs(positions - prev_positions)
@@ -222,7 +293,70 @@ class BaseAlpha(ABC):
         weights = np.nan_to_num(nominals / nominal_tot, nan=0, posinf=0, neginf=0)
         return weights
 
+    #NOTE 10
+    def compute_vol_and_rets(self):
+        vols, rets = [], []
+        for inst in self.instruments:
+            inst_ret = -1 + self.dfs[inst]["close"] / self.dfs[inst].shift(1)["close"]
+            inst_vol = inst_ret.rolling(30).std()
+            rets.append(inst_ret)
+            vols.append(inst_vol)
+        retdf = pd.concat(rets, axis=1)
+        retdf.columns = self.instruments
+        voldf = pd.concat(vols, axis=1)
+        voldf.columns = self.instruments
+        self.pad_zero_dfs["rets"] = retdf
+        self.pad_value_all_dfs["vols"] = voldf
+        return
+    #NOTE 8
+    def align_inst_dfs(self, index):
+        aligner = pd.DataFrame(index=index)
+        for inst in self.instruments:
+            self.dfs[inst] = aligner.join(self.dfs[inst])
+            self.dfs[inst] = self.dfs[inst].fillna(method="ffill").fillna(method="bfill")
+        return
+    #NOTE 9
+    def align_group_dfs(self, index):
+        aligner = pd.DataFrame(index=index)
+        self.pad_zero_dfs = {k:aligner.join(v).fillna(0) for k,v in self.pad_zero_dfs.items()}
+        self.pad_value_all_dfs = {k:aligner.join(v).fillna(method="ffill").fillna(method="bfill") for k,v in self.pad_value_all_dfs.items()}
+        self.pad_ffill_dfs = {k:aligner.join(v).fillna(method="ffill") for k,v in self.pad_ffill_dfs.items()}
+        self.pad_bfill_dfs = {k:aligner.join(v).fillna(method="bfill") for k,v in self.pad_bfill_dfs.items()}
+        return
+
+    #@abstractmethod
+    def param_generator(self, shattered, param_idx=0):
+        return []
+
+    #@abstractmethod
+    def set_positions(self, capital, strat_scalar, portfolio_vol, prev_positions, *args, **kwargs):
+        pass 
+
+    #@abstractmethod
+    def post_risk_management(self, nominal_tot, positions, weights, *args, **kwargs):
+        return nominal_tot, positions, weights
+
+    #@abstractmethod
+    def zip_data_generator(self):
+        pass
+
+    #NOTE 11
+    #@abstractmethod
+    async def compute_signals_unaligned(self, shattered=True, param_idx=0, index=None):
+        return
+
+    #@abstractmethod
+    async def compute_signals_aligned(self, shattered=True, param_idx=0, index=None):
+        return
+
+    #@abstractmethod
+    def instantiate_eligibilities_and_strat_variables(self, delta_lag=0):
+        pass
+    
     async def run_simulation(self, verbose=False, delta_lag=0, shattered=True, param_idx=0):
+        self.dfs = deepcopy(self.datacopy)
+        self.dfs = quant_stats.adjust_prices(self.dfs) #NOTE 12
+
         assert (self.trade_range and self.instruments and self.dfs)
         """
         Settings
@@ -240,8 +374,25 @@ class BaseAlpha(ABC):
         """
         Compute Metas
         """
-        await (self.compute_metas(index=trade_datetime_range, delta_lag=delta_lag, shattered=shattered, param_idx=param_idx))
+        #NOTE 13
+        self.pad_zero_dfs = {}
+        self.pad_value_all_dfs = {}
+        self.pad_ffill_dfs = {}
+        self.pad_bfill_dfs = {}
 
+        self.compute_vol_and_rets()
+        await self.compute_signals_unaligned( 
+            shattered=shattered, param_idx=param_idx, index=trade_datetime_range
+        )
+        self.align_group_dfs(index=trade_datetime_range)
+        self.align_inst_dfs(index=trade_datetime_range)
+        await self.compute_signals_aligned(
+            shattered=shattered, param_idx=param_idx, index=trade_datetime_range
+        )       
+        self.compute_metas(index=trade_datetime_range)
+        self.instantiate_eligibilities_and_strat_variables(delta_lag=delta_lag)
+        self.eligiblesdf.astype("int8")   
+    
         """
         Initialisations
         """
@@ -268,7 +419,6 @@ class BaseAlpha(ABC):
             ret_row = unzipped["ret_row"]
             baseclose_i = unzipped["baseclose_i"]
             baseclose_row = unzipped["baseclose_row"]
-        
             strat_scalar = 2
             
             if portfolio_i != 0:
@@ -386,7 +536,7 @@ class BaseAlpha(ABC):
             print(self.portfolio_df)
 
         return self.portfolio_df
-
+#NOTE 14
 class Amalgapha(BaseAlpha):
 
     def __init__(
@@ -420,9 +570,18 @@ class Amalgapha(BaseAlpha):
 
     def param_generator(self, shattered, param_idx=0):
         return super().param_generator(shattered=shattered)
+    
+    async def compute_signals_aligned(self, shattered=True, param_idx=0, index=None):
+        return
 
-    async def compute_metas(self, index, delta_lag, shattered, param_idx):
-        await (super().compute_metas(index))
+    async def compute_signals_unaligned(self, shattered=True, param_idx=0, index=None):
+        return
+
+    def instantiate_eligibilities_and_strat_variables(self, delta_lag=0):
+        pass
+
+    def compute_metas(self, index):
+        super().compute_metas(index)
         df = pd.DataFrame(index=index)
         weights_dfs = []
         leverages_dfs = []
@@ -486,10 +645,10 @@ class Amalgapha(BaseAlpha):
                 "baseclose_i": baseclose_i, 
                 "baseclose_row": baseclose_row
             }
-
-class Alpha(BaseAlpha, ABC):
+#NOTE 15
+class Alpha(BaseAlpha):#, ABC):
     
-    @abstractmethod
+    #@abstractmethod
     def compute_forecasts(self, portfolio_i, date, eligibles_row):
         pass    
 
@@ -531,6 +690,10 @@ class Alpha(BaseAlpha, ABC):
         portfolio_i=None, ret_i=None, eligibles_row=None, invrisk_row=None, baseclose_row=None, **kwargs):
         
         forecasts, num_trading = self.compute_forecasts(portfolio_i=portfolio_i, date=ret_i, eligibles_row=eligibles_row)
+        if type(forecasts) == pd.Series: forecasts = forecasts.values
+        forecasts = forecasts.astype("float64")
+        num_trading = num_trading.astype("float64")
+
         vol_target = 1 \
             / max(1, num_trading) \
             * capital \
@@ -555,4 +718,3 @@ class Alpha(BaseAlpha, ABC):
         targets = np.nan_to_num(targets, nan=0, posinf=0, neginf=0)
         nominal_tot = np.linalg.norm(positions * baseclose_row, ord=1)
         return positions, targets, nominal_tot, inertia_override
-
