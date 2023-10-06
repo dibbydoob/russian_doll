@@ -9,8 +9,8 @@ from datetime import datetime
 from abc import ABC
 from abc import abstractmethod
 
-import data_service.db_logs as db_logs
-from quantyhlib import quant_stats
+import db_logs as db_logs
+import quant_stats
 
 '''
 NOTE 1:

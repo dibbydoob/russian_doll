@@ -3,14 +3,16 @@ import asyncio
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-
+from quant_stats import stepdown_algorithm
 from copy import deepcopy
 from datetime import datetime
-from quantyhlib.alpha import Alpha
-from quantyhlib import quant_stats
-from quantyhlib.general_utils import save_file, load_file
+from alpha import Alpha
+import quant_stats
+# from quantyhlib.general_utils import save_file, load_file
+import random
+from quant_stats import marginal_family_test
 
-from data_service.data_master import DataMaster
+from data_master import DataMaster
 
 class EQMOM(Alpha):
 
@@ -192,8 +194,7 @@ async def main():
     index_components = index_components[:universe_size]
     component_data = component_data[:universe_size]
 
-    import random
-    from quantyhlib.quant_stats import marginal_family_test
+
 
     '''Run Solo Hypothesis Tests''' 
     dfs = {
@@ -250,7 +251,7 @@ async def main():
     print(exactness)
 
 async def hyothesis_tests_tester():
-    from quantyhlib.quant_stats import stepdown_algorithm
+
     
     criterion_function = lambda sample: np.mean(sample) #identity transform
     norm_ret_gen = lambda: [np.random.normal(0, 16) for _ in range(5000)] #~20 years of trading days
